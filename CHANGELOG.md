@@ -1289,6 +1289,9 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **deps:** Bump the actions group across 1 directory with 6 updates
+- **deps-dev:** Bump @types/node
 
 ### Deprecated
 
