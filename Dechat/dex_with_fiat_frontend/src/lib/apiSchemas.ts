@@ -56,6 +56,11 @@ export const initiateTransferSchema = z
       ),
     recipient: z.string().min(1, 'Recipient is required'),
     reference: z.string().optional(),
+    currency: z
+      .string()
+      .regex(/^[A-Za-z]{3}$/)
+      .optional(),
+    contractReceiptId: z.string().min(1).max(256).optional(),
     clientSessionId: z.string().max(200).optional(),
   })
   .strict();

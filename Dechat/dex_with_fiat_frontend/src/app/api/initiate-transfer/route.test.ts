@@ -4,6 +4,7 @@ import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+import { payoutReservationLedger } from '@/lib/payout/reservationLedger';
 
 vi.mock('server-only', () => ({}));
 
@@ -13,6 +14,7 @@ const mockSchema = z.object({
   amount: z.string().min(1),
   recipient: z.string().min(1),
   reference: z.string().optional(),
+  contractReceiptId: z.string().optional(),
 });
 
 vi.mock('@/lib/telemetry', () => ({
@@ -31,6 +33,9 @@ vi.mock('@sentry/nextjs', () => ({
 vi.mock('@/lib/rateLimit', () => ({
   applyRateLimit: vi.fn(() => null),
   getClientIp: vi.fn(() => '127.0.0.1'),
+  ROUTE_COST_BUCKETS: {
+    '/api/initiate-transfer': { maxRequests: 10, windowMs: 60_000 },
+  },
 }));
 
 const mockTransitionPayoutStatus = vi.fn();
@@ -154,6 +159,32 @@ describe('POST /api/initiate-transfer (Issue #32)', () => {
     expect(
       auditEvents.some((e) => e.action === 'payout_provider_accepted'),
     ).toBe(true);
+  });
+
+  it('links the reserved contract receipt to the accepted provider transfer', async () => {
+    const payoutId = `payout-${Date.now()}`;
+    const receiptId = `receipt-${Date.now()}`;
+    const req = makeRequest(
+      {
+        source: 'wallet',
+        reason: 'payment',
+        amount: '100',
+        recipient: 'GABC123',
+        contractReceiptId: receiptId,
+      },
+      { 'X-Idempotency-Key': payoutId },
+    );
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    expect(payoutReservationLedger.getReservation(payoutId)).toMatchObject({
+      contractReceiptId: receiptId,
+      amountMinor: '10000',
+      currency: 'NGN',
+      providerTransferReference: 'ref-123',
+      status: 'reserved',
+    });
   });
 
   it('enqueues failed provider calls into durable retry queue without losing intent', async () => {

@@ -72,6 +72,9 @@ export interface TransferStatusRecord {
   clientSessionId?: string;
   reconciliationAttempts?: number;
   lastReconciledAt?: string;
+  providerEventAt?: string;
+  webhookReceivedAt?: string;
+  history?: PayoutTransitionRecord[];
   lastReconciliationResult?:
     | 'transitioned'
     | 'no_change'
@@ -95,6 +98,44 @@ export function setTransferStatus(
 ): TransferStatusRecord {
   transferStore.set(record.reference, record);
   return record;
+}
+
+export function transitionPayoutStatus(input: {
+  reference: string;
+  targetStatus: PayoutStatus;
+  actor: PayoutActor | string;
+  providerReference?: string;
+  reason?: string;
+  amount?: number;
+  updatedAt?: string;
+  clientSessionId?: string;
+}): TransferStatusRecord {
+  const current = getTransferStatus(input.reference);
+  const currentStatus = current?.status ?? 'none';
+  validatePayoutTransition(currentStatus, input.targetStatus, input.reference);
+
+  if (currentStatus === input.targetStatus && current) return current;
+
+  const timestamp = input.updatedAt || new Date().toISOString();
+  const transition: PayoutTransitionRecord = {
+    fromStatus: currentStatus,
+    toStatus: input.targetStatus,
+    actor: input.actor,
+    providerReference: input.providerReference,
+    timestamp,
+    reason: input.reason,
+  };
+  return setTransferStatus({
+    reference: input.reference,
+    status: input.targetStatus,
+    amount: input.amount ?? current?.amount ?? 0,
+    amountMinor: current?.amountMinor,
+    currency: current?.currency,
+    failureReason: input.targetStatus === 'failed' ? input.reason : undefined,
+    updatedAt: timestamp,
+    clientSessionId: input.clientSessionId ?? current?.clientSessionId,
+    history: [...(current?.history ?? []), transition],
+  });
 }
 
 export function getAllTransfers(): TransferStatusRecord[] {

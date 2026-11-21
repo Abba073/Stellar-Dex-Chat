@@ -22,6 +22,9 @@ vi.mock('@/lib/serverEnv', () => ({
 vi.mock('@/lib/rateLimit', () => ({
   applyRateLimit: () => null,
   getClientIp: () => '127.0.0.1',
+  ROUTE_COST_BUCKETS: {
+    '/api/webhook': { maxRequests: 10, windowMs: 60_000 },
+  },
 }));
 
 vi.mock('@/lib/telemetry', () => ({
