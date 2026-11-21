@@ -9,6 +9,15 @@ import {
   handlePayoutApiError,
 } from '@/lib/payout/circuitBreaker';
 import { getOrCreateBeneficiary } from '@/lib/payout/beneficiaryStore';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  logStructuredError,
+} from '@/lib/payout/errors';
+import {
+  enforcePayoutApiVersion,
+  payoutSuccessResponse,
+} from '@/lib/payout/schemaEvolution';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
 
@@ -23,8 +32,11 @@ export async function POST(request: NextRequest) {
   // 1. Enforce payout API security: Origin, Sec-Fetch-Site, CSRF, and explicit CORS
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
 
   const ip = getClientIp(request);
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   const limited = applyRateLimit(ip, '/api/create-recipient', RATE_LIMIT);
   if (limited) return limited;
@@ -123,15 +135,15 @@ export async function POST(request: NextRequest) {
 
     telemetry.finishSpan(span.spanId, { success: true });
 
-    const apiResponse = NextResponse.json({
-      success: true,
-      data: {
+    const apiResponse = payoutSuccessResponse(
+      {
         recipient_code: beneficiaryResult.recipientCode,
         name: beneficiaryResult.name,
         reused: beneficiaryResult.reused,
         recovered: beneficiaryResult.recovered,
       },
-    });
+      { correlationId },
+    );
 
     telemetry.setTraceHeaders(apiResponse.headers, traceContext);
     return apiResponse;

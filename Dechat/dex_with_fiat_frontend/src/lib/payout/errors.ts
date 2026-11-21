@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 
 export const API_VERSION = 'v1' as const;
+export const API_VERSION_HEADER = 'X-API-Version';
+export const SUPPORTED_API_VERSIONS = ['v1'] as const;
+export const PAYOUT_API_DEPRECATION_WINDOW_MONTHS = 6;
 
 export type PayoutErrorCategory =
   | 'validation'
@@ -15,6 +18,7 @@ export type PayoutErrorCode =
   | 'VALIDATION_ERROR'
   | 'MALFORMED_REQUEST'
   | 'INVALID_INPUT'
+  | 'UNSUPPORTED_API_VERSION'
   // Authorization errors (401, 403)
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
@@ -214,11 +218,19 @@ export function createPayoutErrorResponse(options: {
 export function validationError(options: {
   message?: string;
   correlationId?: string;
-  issues?: Array<{ path?: (string | number)[]; message: string; code?: string }>;
+  issues?: ReadonlyArray<{
+    path?: readonly PropertyKey[];
+    message: string;
+    code?: string;
+  }>;
   code?: PayoutErrorCode;
 }): NextResponse {
   const details: PayoutErrorDetail[] = (options.issues || []).map((issue) => ({
-    field: issue.path ? issue.path.join('.') : undefined,
+    field: issue.path
+      ? issue.path
+          .filter((part): part is string | number => typeof part !== 'symbol')
+          .join('.')
+      : undefined,
     message: issue.message,
     code: issue.code,
   }));

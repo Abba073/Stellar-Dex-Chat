@@ -1,20 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
-import { credentialManager } from '@/lib/payout/credentialManager';
 import {
-  AmbiguousInitiationError,
-  ProviderTimeoutError,
   sanitizeProviderError,
 } from '@/lib/payout/timeoutBudget';
-import { reconcileAmbiguousInitiation } from '@/lib/payout/reconciliation';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  logStructuredError,
+} from '@/lib/payout/errors';
+import {
+  enforcePayoutApiVersion,
+  payoutSuccessResponse,
+} from '@/lib/payout/schemaEvolution';
+import { handlePayoutApiError } from '@/lib/payout/circuitBreaker';
+import { validatePayoutAmount } from '@/lib/payout/minorUnits';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
@@ -35,8 +42,18 @@ export async function POST(request: NextRequest) {
   // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
+  if (!request.headers.get('X-Idempotency-Key')) {
+    return validationError({
+      message: 'X-Idempotency-Key header is required',
+      correlationId: extractOrGenerateCorrelationId(request.headers),
+      code: 'VALIDATION_ERROR',
+    });
+  }
 
   const ip = getClientIp(request);
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
@@ -47,6 +64,7 @@ export async function POST(request: NextRequest) {
     traceContext.spanId,
     traceContext.traceId,
   );
+  let idempotencyKey = '';
 
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting transfer initiation', {
@@ -101,23 +119,6 @@ export async function POST(request: NextRequest) {
         ? bodyRecord.clientSessionId
         : undefined);
 
-    const activeCred = credentialManager.getActiveCredential();
-    const credentialVersion = activeCred?.version || 'v1';
-
-    // Idempotency key from header, body reference, or generated fallback
-    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
-    const idempotencyKey =
-      headerIdempotencyKey ||
-      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
-        ? bodyRecord.reference
-        : null) ||
-      `idem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-
-    const cached = idempotencyCache.get(idempotencyKey);
-    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-      return NextResponse.json({ success: true, data: cached.result });
-    }
-
     // Validate payout amounts using integer minor units (Issue #40)
     const currency =
       typeof bodyRecord.currency === 'string' ? bodyRecord.currency : 'NGN';
@@ -125,7 +126,7 @@ export async function POST(request: NextRequest) {
 
     // Resolve idempotency key: X-Idempotency-Key header, body reference, or generated
     const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
-    const idempotencyKey =
+    idempotencyKey =
       headerIdempotencyKey ||
       (typeof bodyRecord.reference === 'string' && bodyRecord.reference
         ? bodyRecord.reference
@@ -133,7 +134,7 @@ export async function POST(request: NextRequest) {
 
     const cached = idempotencyCache.get(idempotencyKey);
     if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-      return NextResponse.json({ success: true, data: cached.result });
+      return payoutSuccessResponse(cached.result, { correlationId });
     }
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
@@ -192,7 +193,7 @@ export async function POST(request: NextRequest) {
         actor: 'provider:paystack',
         requestCorrelationId: traceContext.traceId,
         providerReference: transferReference,
-        metadata: { data: data as Record<string, unknown> },
+        metadata: { data: data as unknown as Record<string, unknown> },
       });
 
       idempotencyCache.set(idempotencyKey, {
@@ -200,10 +201,7 @@ export async function POST(request: NextRequest) {
         timestamp: Date.now(),
       });
 
-      return NextResponse.json({
-        success: true,
-        data,
-      });
+      return payoutSuccessResponse(data, { correlationId });
     } catch (providerError: unknown) {
       const errorMessage =
         providerError instanceof Error
@@ -228,8 +226,8 @@ export async function POST(request: NextRequest) {
         reference: idempotencyKey,
         status: 'pending',
         amount: Number(amount),
-        updatedAt: new Date(now).toISOString(),
-        updatedAtMs: now,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
         clientSessionId,
         failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
       });
@@ -245,15 +243,21 @@ export async function POST(request: NextRequest) {
         },
       );
 
-      return NextResponse.json(
+      return payoutSuccessResponse(
         {
-          success: true,
-          status: 'queued_for_retry',
           reference: idempotencyKey,
           jobId: retryJob.id,
-          message: 'Transfer queued for retry due to provider failure',
         },
-        { status: 202 },
+        {
+          status: 202,
+          correlationId,
+          extra: {
+            status: 'queued_for_retry',
+            reference: idempotencyKey,
+            jobId: retryJob.id,
+            message: 'Transfer queued for retry due to provider failure',
+          },
+        },
       );
     }
   } catch (error: unknown) {

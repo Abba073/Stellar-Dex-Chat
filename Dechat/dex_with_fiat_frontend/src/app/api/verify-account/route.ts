@@ -8,6 +8,15 @@ import {
   getProviderCircuitBreaker,
   handlePayoutApiError,
 } from '@/lib/payout/circuitBreaker';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  logStructuredError,
+} from '@/lib/payout/errors';
+import {
+  enforcePayoutApiVersion,
+  payoutSuccessResponse,
+} from '@/lib/payout/schemaEvolution';
 
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 
@@ -22,8 +31,11 @@ export async function POST(request: NextRequest) {
   // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
 
   const ip = getClientIp(request);
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   const limited = applyRateLimit(ip, '/api/verify-account', RATE_LIMIT);
   if (limited) return limited;
@@ -99,7 +111,7 @@ export async function POST(request: NextRequest) {
 
     telemetry.finishSpan(span.spanId, { success: true });
 
-    const apiResponse = NextResponse.json({ success: true, data });
+    const apiResponse = payoutSuccessResponse(data, { correlationId });
     apiResponse.headers.set('X-Correlation-Id', correlationId);
     telemetry.setTraceHeaders(apiResponse.headers, traceContext);
     return apiResponse;

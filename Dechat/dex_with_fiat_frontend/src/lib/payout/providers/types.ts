@@ -115,7 +115,21 @@ export interface InitiateTransferInput {
   amount: number | string;
   recipient: string;
   reference?: string;
+  idempotencyKey?: string;
+  currency?: string;
   credentialVersion?: string;
+}
+
+export interface InitiatedTransfer {
+  reference: string;
+  status: NormalizedPayoutStatus;
+  providerReference?: string;
+  transferCode?: string;
+  amountMinor?: bigint;
+  currency?: string;
+  recipientCode?: string;
+  credentialVersion?: string;
+  rawResponse?: unknown;
 }
 
 // Backward compatibility alias
