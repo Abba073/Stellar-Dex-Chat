@@ -11,11 +11,7 @@ export type PayoutProviderName = 'paystack' | 'fake';
  * Every provider adapter maps proprietary provider statuses to this canonical set.
  */
 export type NormalizedPayoutStatus =
-  | 'pending'
-  | 'success'
-  | 'failed'
-  | 'reversed'
-  | 'cancelled';
+  'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
 
 /**
  * Standardized error categories returned by provider adapters.
@@ -118,6 +114,19 @@ export interface InitiateTransferInput {
   credentialVersion?: string;
 }
 
+export interface InitiatedTransfer {
+  reference: string;
+  status?: string;
+  id?: string | number;
+  transfer_code?: string;
+  transferCode?: string;
+  providerReference?: string;
+  amount?: number;
+  amountMinor?: number | bigint;
+  currency?: string;
+  rawResponse?: unknown;
+}
+
 // Backward compatibility alias
 export type InitiateTransferResult = InitiatedTransfer;
 
@@ -172,7 +181,5 @@ export interface PayoutProvider {
   checkTransferStatus(
     input: TransferStatusInput,
   ): Promise<TransferStatusResult>;
-  cancelTransfer?(
-    input: CancelTransferInput,
-  ): Promise<CancelTransferResult>;
+  cancelTransfer?(input: CancelTransferInput): Promise<CancelTransferResult>;
 }
