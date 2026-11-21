@@ -27,7 +27,15 @@ async function mockBankApis(page: import('@playwright/test').Page) {
   );
   await page.route('**/api/verify-account', (route) =>
     route.fulfill({
-      json: { success: true, data: { account_name: 'John Doe' } },
+      json: {
+        success: true,
+        data: {
+          account_name: 'John Doe',
+          accountNumberMasked: '******7890',
+          verificationToken: 'test-verification-token',
+          verificationExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+        },
+      },
     }),
   );
   await page.route('**/api/create-recipient', (route) =>

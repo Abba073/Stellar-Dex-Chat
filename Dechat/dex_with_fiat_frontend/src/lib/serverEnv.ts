@@ -12,6 +12,7 @@ export const serverSchema = z.object({
     return normalized === 'true' || normalized === '1';
   }, z.boolean().default(false)),
   ADMIN_SECRET: z.string().optional(),
+  BENEFICIARY_DEDUPE_SECRET: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
 });
 
@@ -22,6 +23,10 @@ const processServerEnvVars = () => {
     ADMIN_IP_ALLOWLIST: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST : undefined,
     ADMIN_IP_ALLOWLIST_BYPASS_LOCAL: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST_BYPASS_LOCAL : undefined,
     ADMIN_SECRET: typeof process !== 'undefined' ? process.env.ADMIN_SECRET : undefined,
+    BENEFICIARY_DEDUPE_SECRET:
+      typeof process !== 'undefined'
+        ? process.env.BENEFICIARY_DEDUPE_SECRET
+        : undefined,
     GEMINI_API_KEY: typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined,
   };
 

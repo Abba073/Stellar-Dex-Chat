@@ -25,6 +25,7 @@ Scope: durable payout state — payout **intents**, **idempotency records**, and
   - Daily full snapshots: **35 days**.
   - Monthly archives (audit history): **13 months**.
 - **Dependencies:** managed database PITR/snapshot service, KMS key availability, object storage bucket, and the audit-log sink. Each dependency has its own owner and is listed in the service dependency register.
+- **Beneficiary verification:** all payout application instances must receive the same `BENEFICIARY_DEDUPE_SECRET` from the secret manager. Do not include it in backups or logs. Rotating it invalidates outstanding five-minute beneficiary verification tokens; coordinated rotation requires no transfer replay.
 
 ## 3. Restore permissions
 

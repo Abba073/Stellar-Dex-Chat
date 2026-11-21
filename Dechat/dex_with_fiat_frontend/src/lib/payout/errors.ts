@@ -15,6 +15,9 @@ export type PayoutErrorCode =
   | 'VALIDATION_ERROR'
   | 'MALFORMED_REQUEST'
   | 'INVALID_INPUT'
+  | 'BENEFICIARY_VERIFICATION_REQUIRED'
+  | 'BENEFICIARY_VERIFICATION_EXPIRED'
+  | 'BENEFICIARY_DETAILS_CHANGED'
   // Authorization errors (401, 403)
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
@@ -231,7 +234,12 @@ export function validationError(options: {
     retryable: false,
     correlationId: options.correlationId,
     details,
-    rawErrors: options.issues,
+    rawErrors: options.issues?.map((issue) => ({
+      path: issue.path
+        ?.filter((part): part is string | number => typeof part !== 'symbol'),
+      message: issue.message,
+      code: issue.code,
+    })),
   });
 }
 
