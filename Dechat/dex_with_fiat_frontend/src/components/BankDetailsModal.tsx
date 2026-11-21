@@ -42,6 +42,7 @@ import {
   type ResumableTransferState,
 } from '@/lib/transferStatusReconciler';
 import { z } from 'zod';
+import { useRtlDirection } from '@/hooks/useRtlDirection';
 
 /** ISO 13616 MOD-97 check used by the IBAN standard. */
 function validateIbanMod97(iban: string): boolean {
@@ -174,6 +175,7 @@ export default function BankDetailsModal({
 }: BankDetailsModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
   const prefersReducedMotion = useReducedMotion();
+  const { isRtl, dir } = useRtlDirection();
   const {
     beneficiaries,
     isLoaded: beneficiariesLoaded,
@@ -848,6 +850,7 @@ export default function BankDetailsModal({
         aria-modal="true"
         aria-label="Fiat payout"
         tabIndex={-1}
+        dir={dir}
         className="theme-surface theme-border relative w-full max-w-md mx-4 border rounded-2xl shadow-2xl p-6"
         variants={modalVariants}
         initial={prefersReducedMotion ? false : 'hidden'}
@@ -886,7 +889,7 @@ export default function BankDetailsModal({
 
         {/* Step indicators - hidden on the success screen */}
         {step < 4 && (
-          <div className="flex items-center gap-1 mb-6">
+          <div className="flex items-center gap-1 mb-6 step-indicator">
             {([1, 2, 3] as const).map((s) => (
               <React.Fragment key={s}>
                 <div
@@ -934,7 +937,7 @@ export default function BankDetailsModal({
                       <Star className="w-4 h-4" />
                       Use saved beneficiary ({beneficiaries.length})
                       <ChevronRight
-                        className={`w-3 h-3 transition-transform ${showSavedBeneficiaries ? 'rotate-90' : ''}`}
+                        className={`w-3 h-3 transition-transform icon-directional ${showSavedBeneficiaries ? 'rotate-90' : ''}`}
                       />
                     </button>
 
@@ -1084,7 +1087,7 @@ export default function BankDetailsModal({
                   disabled={!selectedBank}
                   className="mt-4 w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-3 rounded-lg font-medium transition-colors"
                 >
-                  Next <ChevronRight className="w-4 h-4" />
+                  Next <ChevronRight className="w-4 h-4 icon-directional" />
                 </button>
               </div>
             </motion.div>
@@ -1128,7 +1131,7 @@ export default function BankDetailsModal({
                     onBlur={handleVerifyAccount}
                     maxLength={10}
                     placeholder="0000000000"
-                    className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                    className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 input-numeric"
                   />
                 </div>
 
@@ -1145,7 +1148,7 @@ export default function BankDetailsModal({
                     placeholder="GB29 NWBK 6016 1331 9268 19"
                     aria-describedby={ibanError ? 'iban-error' : undefined}
                     aria-invalid={ibanTouched && !!ibanError}
-                    className={`w-full bg-gray-800 border rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none uppercase tracking-widest text-sm ${
+                    className={`w-full bg-gray-800 border rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none uppercase tracking-widest text-sm input-numeric ${
                       ibanTouched && ibanError
                         ? 'border-red-500 focus:border-red-500'
                         : ibanTouched && iban && !ibanError
@@ -1302,7 +1305,7 @@ export default function BankDetailsModal({
                     disabled={!verifiedAccount}
                     className="flex-1 flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-3 rounded-lg font-medium transition-colors"
                   >
-                    Next <ChevronRight className="w-4 h-4" />
+                    Next <ChevronRight className="w-4 h-4 icon-directional" />
                   </button>
                 </div>
               </div>
@@ -1338,7 +1341,7 @@ export default function BankDetailsModal({
                     {quoteLoading ? (
                       <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
                     ) : lockedQuote !== null ? (
-                      <span className="theme-text-primary font-medium">
+                      <span className="theme-text-primary font-medium amount-ltr">
                         ₦
                         {lockedQuote.ngnAmount.toLocaleString('en-NG', {
                           minimumFractionDigits: 2,
@@ -1408,7 +1411,7 @@ export default function BankDetailsModal({
                       <span className="theme-text-secondary">
                         Account number
                       </span>
-                      <span className="theme-text-primary font-medium font-mono">
+                      <span className="theme-text-primary font-medium font-mono amount-ltr">
                         {accountNumber}
                       </span>
                     </div>
