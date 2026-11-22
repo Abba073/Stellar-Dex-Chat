@@ -219,6 +219,7 @@ export default function BankDetailsModal({
   const [banks, setBanks] = useState<Bank[]>([]);
   const [banksLoading, setBanksLoading] = useState(false);
   const [banksError, setBanksError] = useState('');
+  const [banksAccessibleError, setBanksAccessibleError] = useState<AccessibleError | null>(null);
   const [bankSearch, setBankSearch] = useState('');
   const [selectedBank, setSelectedBank] = useState<Bank | null>(null);
 
@@ -229,6 +230,7 @@ export default function BankDetailsModal({
   const [ibanTouched, setIbanTouched] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verifyError, setVerifyError] = useState('');
+  const [verifyAccessibleError, setVerifyAccessibleError] = useState<AccessibleError | null>(null);
   const [verifiedAccount, setVerifiedAccount] =
     useState<VerifyAccountData | null>(null);
 
@@ -238,6 +240,7 @@ export default function BankDetailsModal({
   const [quoteSecondsLeft, setQuoteSecondsLeft] = useState(120);
   const [payoutLoading, setPayoutLoading] = useState(false);
   const [payoutError, setPayoutError] = useState('');
+  const [payoutAccessibleError, setPayoutAccessibleError] = useState<AccessibleError | null>(null);
   const [payoutNote, setPayoutNote] = useState('');
 
   // Stellar Wallet Context (defensive fallback when not wrapped in provider)
@@ -305,13 +308,18 @@ export default function BankDetailsModal({
       .then((json: { success: boolean; data: Bank[]; message?: string }) => {
         if (json.success) {
           setBanks(json.data);
+          setBanksAccessibleError(null);
         } else {
-          setBanksError(json.message ?? 'Failed to load banks');
+          const msg = json.message ?? 'Failed to load banks';
+          setBanksError(msg);
+          setBanksAccessibleError(classifyError(msg));
         }
       })
       .catch((err: unknown) => {
         if (err instanceof Error && err.name === 'AbortError') return;
-        setBanksError('Failed to load banks. Please try again.');
+        const msg = 'Failed to load banks. Please try again.';
+        setBanksError(msg);
+        setBanksAccessibleError(classifyError(err));
       })
       .finally(() => {
         if (!abortController.signal.aborted) setBanksLoading(false);
@@ -503,22 +511,26 @@ export default function BankDetailsModal({
       } = await res.json();
       if (json.success) {
         setVerifiedAccount(json.data);
+        setVerifyAccessibleError(null);
         chatTelemetry.fiatPayoutStep({
           action: 'account_verify_success',
           step: 2,
           xlmAmount,
         });
       } else {
-        setVerifyError(json.message ?? 'Account verification failed');
+        const msg = json.message ?? 'Account verification failed';
+        setVerifyError(msg);
+        setVerifyAccessibleError(classifyError(msg, { httpStatus: res.ok ? undefined : res.status, fieldId: 'bdm-account-number', safeValues: { accountNumber } }));
         chatTelemetry.fiatPayoutStep({
           action: 'account_verify_fail',
           step: 2,
           xlmAmount,
-          errorMessage: json.message ?? 'Account verification failed',
+          errorMessage: msg,
         });
       }
     } catch {
       setVerifyError('Account verification failed. Please try again.');
+      setVerifyAccessibleError(classifyError('Account verification failed. Please try again.', { fieldId: 'bdm-account-number', safeValues: { accountNumber } }));
       chatTelemetry.fiatPayoutStep({
         action: 'account_verify_fail',
         step: 2,
@@ -543,11 +555,9 @@ export default function BankDetailsModal({
 
     // Check wallet session if StellarWalletContext is active
     if (walletContext && (!isWalletConnected || isWalletSessionExpired)) {
-      setPayoutError(
-        isWalletSessionExpired
-          ? 'Wallet session has expired. Please reconnect to continue.'
-          : 'Wallet disconnected. Please reconnect to continue.',
-      );
+      const rawMsg = isWalletSessionExpired ? 'Wallet session has expired. Please reconnect to continue.' : 'Wallet disconnected. Please reconnect to continue.';
+      setPayoutError(rawMsg);
+      setPayoutAccessibleError(classifyError(rawMsg));
       return;
     }
 
@@ -564,9 +574,9 @@ export default function BankDetailsModal({
       if (activeAddress) {
         const acquireResult = acquireIntent(idempotencyKey);
         if (!acquireResult.acquired) {
-          setPayoutError(
-            'This payout is already being processed in another tab. Duplicate submission prevented.',
-          );
+          const dupMsg = 'This payout is already being processed in another tab. Duplicate submission prevented.';
+          setPayoutError(dupMsg);
+          setPayoutAccessibleError(classifyError(dupMsg));
           return;
         }
       }
@@ -578,6 +588,7 @@ export default function BankDetailsModal({
       });
       setPayoutLoading(true);
       setPayoutError('');
+      setPayoutAccessibleError(null);
       setStatusEvents([]);
       setTransferFailureReason('');
 
@@ -721,6 +732,7 @@ export default function BankDetailsModal({
           errorMessage: errorMsg,
         });
         setPayoutError(errorMsg);
+        setPayoutAccessibleError(classifyError(err, { safeValues: { accountNumber } }));
         setIsPollingStatus(false);
         currentTimeline = reconcileTransferStatus(currentTimeline, {
           stage: 'provider',
@@ -746,6 +758,7 @@ export default function BankDetailsModal({
     setBanks([]);
     setBanksLoading(false);
     setBanksError('');
+    setBanksAccessibleError(null);
     setBankSearch('');
     setSelectedBank(null);
     setAccountNumber('');
@@ -754,12 +767,14 @@ export default function BankDetailsModal({
     setIbanTouched(false);
     setVerifying(false);
     setVerifyError('');
+    setVerifyAccessibleError(null);
     setVerifiedAccount(null);
     setLockedQuote(null);
     setQuoteLoading(false);
     setQuoteSecondsLeft(120);
     setPayoutLoading(false);
     setPayoutError('');
+    setPayoutAccessibleError(null);
     setPayoutNote('');
     setTransferReference('');
     setTransferStatus('pending');
@@ -1032,10 +1047,7 @@ export default function BankDetailsModal({
                 {banksLoading ? (
                   <SkeletonWallet />
                 ) : banksError ? (
-                  <div className="flex items-center gap-2 text-red-400 text-sm py-4">
-                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                    <span>{banksError}</span>
-                  </div>
+                  <ErrorSummary id="bdm-banks-error" error={banksAccessibleError} inline data-testid="banks-error" />
                 ) : (
                   <>
                     <div className="relative mb-3">
@@ -1122,12 +1134,14 @@ export default function BankDetailsModal({
                   </label>
                   <input
                     type="text"
+                    id="bdm-account-number"
                     inputMode="numeric"
                     value={accountNumber}
                     onChange={(e) => {
                       setAccountNumber(e.target.value);
                       setVerifiedAccount(null);
                       setVerifyError('');
+                      setVerifyAccessibleError(null);
                     }}
                     onBlur={handleVerifyAccount}
                     maxLength={10}
@@ -1196,15 +1210,7 @@ export default function BankDetailsModal({
                 )}
 
                 {verifyError && !verifying && (
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className="flex items-center gap-2 text-red-400 text-sm mb-3 bg-red-400/10 rounded-lg px-3 py-2"
-                  >
-                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                    <span>{verifyError}</span>
-                  </motion.div>
+                  <ErrorSummary id="bdm-verify-error" error={verifyAccessibleError} inline data-testid="verify-error" />
                 )}
 
                 {verifiedAccount && !verifying && (
@@ -1540,15 +1546,7 @@ export default function BankDetailsModal({
                   )}
 
                 {payoutError && (
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className="theme-soft-danger flex items-center gap-2 text-sm mb-4 rounded-lg px-3 py-2 border"
-                  >
-                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                    <span>{payoutError}</span>
-                  </motion.div>
+                  <ErrorSummary id="bdm-payout-error" error={payoutAccessibleError} onDismiss={() => { setPayoutError(''); setPayoutAccessibleError(null); }} data-testid="payout-error" />
                 )}
 
                 <div className="flex gap-3">
