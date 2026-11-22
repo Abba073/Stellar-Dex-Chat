@@ -62,10 +62,23 @@ export const initiateTransferSchema = z
       .optional(),
     contractReceiptId: z.string().min(1).max(256).optional(),
     clientSessionId: z.string().max(200).optional(),
+    currency: z.string().length(3).optional(),
+    quoteId: z.string().uuid().optional(),
+    quoteToken: z.string().min(1).max(4096).optional(),
   })
   .strict();
 
 export type InitiateTransferInput = z.infer<typeof initiateTransferSchema>;
+
+export const fxQuoteRequestSchema = z
+  .object({
+    tokenSymbol: z.literal('XLM'),
+    tokenAmount: z.number().positive().max(1_000_000),
+    currency: z.literal('ngn'),
+  })
+  .strict();
+
+export type FxQuoteRequest = z.infer<typeof fxQuoteRequestSchema>;
 
 // Schema for verify-account endpoint (strict validation, unknown keys rejected)
 export const verifyAccountSchema = strictVerifyAccountSchema;

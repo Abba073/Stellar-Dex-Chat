@@ -4,6 +4,10 @@ import {
   PayoutTransitionRecord,
   validatePayoutTransition,
 } from './payout/payoutLifecycle';
+import type {
+  FxQuoteRecord,
+  FxQuoteTransferValues,
+} from './payout/fxQuoteProvenance';
 
 export {
   type PayoutStatus,
@@ -66,6 +70,8 @@ export interface TransferStatusRecord {
   amount: number;
   amountMinor?: bigint;
   currency?: string;
+  fxQuote?: FxQuoteRecord;
+  finalTransferValues?: FxQuoteTransferValues;
   failureReason?: string;
   updatedAt: string;
   updatedAtMs?: number;

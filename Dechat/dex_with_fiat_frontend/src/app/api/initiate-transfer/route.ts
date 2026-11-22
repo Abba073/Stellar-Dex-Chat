@@ -2,21 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
-import { credentialManager } from '@/lib/payout/credentialManager';
+import { sanitizeProviderError } from '@/lib/payout/timeoutBudget';
 import { telemetry } from '@/lib/telemetry';
-import {
-  applyRateLimit,
-  getClientIp,
-  ROUTE_COST_BUCKETS,
-} from '@/lib/rateLimit';
-import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
-import { handlePayoutApiError } from '@/lib/payout/circuitBreaker';
-import {
-  logStructuredError,
-  extractOrGenerateCorrelationId,
-  validationError,
-} from '@/lib/payout/errors';
-import { validatePayoutAmount } from '@/lib/payout/minorUnits';
+import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
@@ -26,12 +14,26 @@ import {
 } from '@/lib/payout/reservationLedger';
 import { ProviderIdempotencyReconciliationRequiredError } from '@/lib/payout/providerIdempotency';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
+import {
+  createPayoutErrorResponse,
+  extractOrGenerateCorrelationId,
+  logStructuredError,
+  validationError,
+} from '@/lib/payout/errors';
+import { validatePayoutAmount } from '@/lib/payout/minorUnits';
+import {
+  verifyFxQuote,
+  type FxQuoteTransferValues,
+} from '@/lib/payout/fxQuoteProvenance';
+import type { InitiatedTransfer } from '@/lib/payout/providers/types';
+import { handlePayoutApiError } from '@/lib/payout/circuitBreaker';
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const RATE_LIMIT = ROUTE_COST_BUCKETS['/api/initiate-transfer'];
 const idempotencyCache = new Map<
   string,
-  { result: unknown; payloadHash: string; timestamp: number }
+  { result: unknown; timestamp: number; requestFingerprint: string }
 >();
 
 function hashPayoutRequest(payload: {
@@ -65,6 +67,14 @@ export async function POST(request: NextRequest) {
   if (securityBlocked) return securityBlocked;
 
   const correlationId = extractOrGenerateCorrelationId(request.headers);
+  const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+  if (!headerIdempotencyKey) {
+    return validationError({
+      message: 'X-Idempotency-Key header is required',
+      correlationId,
+    });
+  }
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT, {
     correlationId,
@@ -77,7 +87,7 @@ export async function POST(request: NextRequest) {
     traceContext.spanId,
     traceContext.traceId,
   );
-  let idempotencyKey = '';
+  const idempotencyKey = headerIdempotencyKey;
 
   try {
     let body: unknown;
@@ -121,67 +131,127 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const { source, reason, amount, recipient, contractReceiptId } =
-      validationResult.data;
-    const currency =
-      typeof bodyRecord.currency === 'string'
-        ? bodyRecord.currency.toUpperCase()
-        : 'NGN';
-    const validatedAmount = validatePayoutAmount(amount, currency);
-    const payloadHash = hashPayoutRequest({
+    const {
       source,
       reason,
-      amountMinor: validatedAmount.amountMinor,
-      currency,
+      amount,
       recipient,
-      contractReceiptId,
-    });
+      currency,
+      quoteId,
+      quoteToken,
+      clientSessionId: bodyClientSessionId,
+    } = validationResult.data;
+    const clientSessionId =
+      request.headers.get('x-client-session-id') || bodyClientSessionId;
 
+    if (!quoteId || !quoteToken) {
+      return createPayoutErrorResponse({
+        status: 428,
+        code: 'FX_QUOTE_REQUIRED',
+        userMessage: 'A valid FX quote is required to initiate this payout.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const payoutCurrency = (currency || 'NGN').toUpperCase();
+    const validatedAmount = validatePayoutAmount(amount, payoutCurrency);
+    const requestFingerprint = crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({
+          source,
+          reason: reason ?? null,
+          amountMinorUnits: validatedAmount.amountMinor.toString(),
+          currency: payoutCurrency,
+          recipient,
+          quoteId,
+          quoteToken,
+        }),
+      )
+      .digest('hex');
     const cached = idempotencyCache.get(idempotencyKey);
     if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-      if (cached.payloadHash !== payloadHash) {
-        return NextResponse.json(
-          {
-            success: false,
-            message:
-              'Idempotency key was already used with a different request.',
-          },
-          { status: 409 },
-        );
+      if (cached.requestFingerprint !== requestFingerprint) {
+        return createPayoutErrorResponse({
+          status: 409,
+          code: 'IDEMPOTENCY_CONFLICT',
+          userMessage:
+            'This idempotency key was already used with different payout details.',
+          category: 'validation',
+          retryable: false,
+          correlationId,
+        });
       }
       return NextResponse.json({ success: true, data: cached.result });
     }
-    if (cached) idempotencyCache.delete(idempotencyKey);
 
-    const clientSessionId =
-      request.headers.get('x-client-session-id') ||
-      (typeof bodyRecord.clientSessionId === 'string'
-        ? bodyRecord.clientSessionId
-        : undefined);
-    const credentialVersion =
-      credentialManager.getActiveCredential()?.version || 'v1';
-    const now = new Date().toISOString();
-
-    if (contractReceiptId) {
-      try {
-        payoutReservationLedger.reserve({
-          payoutId: idempotencyKey,
-          contractReceiptId,
-          amountMinor: validatedAmount.amountMinor,
-          currency,
-          timestamp: now,
-        });
-      } catch (error) {
-        if (error instanceof PayoutReservationConflictError) {
-          return NextResponse.json(
-            { success: false, message: error.message },
-            { status: 409 },
-          );
-        }
-        throw error;
-      }
+    const verifiedQuote = verifyFxQuote(quoteToken);
+    if (!verifiedQuote.valid) {
+      const expired = verifiedQuote.reason === 'expired';
+      return createPayoutErrorResponse({
+        status: expired ? 410 : 409,
+        code: expired ? 'FX_QUOTE_EXPIRED' : 'FX_QUOTE_MISMATCH',
+        userMessage: expired
+          ? 'The FX quote has expired. Request a new quote before continuing.'
+          : 'The FX quote is invalid. Request a new quote before continuing.',
+        category: expired ? 'validation' : 'authorization',
+        retryable: false,
+        correlationId,
+      });
     }
 
+    const quote = verifiedQuote.quote;
+    if (
+      quote.quoteId !== quoteId ||
+      quote.currency !== payoutCurrency ||
+      quote.precisionDecimals !== validatedAmount.exponent ||
+      quote.fiatAmountMinorUnits !== validatedAmount.amountMinor.toString()
+    ) {
+      return createPayoutErrorResponse({
+        status: 409,
+        code: 'FX_QUOTE_MISMATCH',
+        userMessage:
+          'The payout amount or currency does not match the FX quote.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
+    }
+    if (cached) idempotencyCache.delete(idempotencyKey);
+
+    telemetry.addLog(span.spanId, 'info', 'Request validated', {
+      hasSource: !!source,
+      hasAmount: !!amount,
+      hasRecipient: !!recipient,
+      currency: payoutCurrency,
+      amountMinorUnits: validatedAmount.amountMinor.toString(),
+      quoteId: quote.quoteId,
+      idempotencyKey,
+    });
+
+    if (Date.now() >= quote.expiresAt) {
+      return createPayoutErrorResponse({
+        status: 410,
+        code: 'FX_QUOTE_EXPIRED',
+        userMessage: 'The FX quote expired before payout submission.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const initialTransferValues: FxQuoteTransferValues = {
+      amountMinorUnits: validatedAmount.amountMinor.toString(),
+      providerAmountMinorUnits: validatedAmount.amountMinor.toString(),
+      currency: payoutCurrency,
+      providerReference: idempotencyKey,
+      providerTransferId: null,
+      providerTransferCode: null,
+    };
+
+    // Record immutable audit event for payout initiation (Issue #38)
     payoutAuditLedger.recordEvent({
       payoutId: idempotencyKey,
       action: 'payout_initiated',
@@ -191,15 +261,26 @@ export async function POST(request: NextRequest) {
       metadata: {
         source,
         reason,
-        amountMinor: validatedAmount.amountMinor.toString(),
-        currency,
-        contractReceiptId,
+        fxQuote: quote,
+        finalTransferValues: initialTransferValues,
+        recipient,
       },
     });
 
     const provider = getPayoutProvider();
     try {
-      const data = await provider.initiateTransfer({
+      if (Date.now() >= quote.expiresAt) {
+        return createPayoutErrorResponse({
+          status: 410,
+          code: 'FX_QUOTE_EXPIRED',
+          userMessage: 'The FX quote expired before payout submission.',
+          category: 'validation',
+          retryable: false,
+          correlationId,
+        });
+      }
+
+      const data: InitiatedTransfer = await provider.initiateTransfer({
         source,
         reason,
         amount: validatedAmount.canonicalDecimal,
@@ -210,21 +291,46 @@ export async function POST(request: NextRequest) {
         credentialVersion,
       });
 
-      const transferReference = data.reference || idempotencyKey;
-      setTransferStatus({
-        reference: transferReference,
-        status: data.status || 'pending',
-        amount: Number(validatedAmount.canonicalDecimal),
-        amountMinor: validatedAmount.amountMinor,
-        currency,
-        updatedAt: new Date().toISOString(),
-        clientSessionId,
-      });
-      if (contractReceiptId) {
-        payoutReservationLedger.linkProviderTransfer(
-          idempotencyKey,
-          transferReference,
-        );
+      const transferReference =
+        typeof data.reference === 'string' && data.reference
+          ? data.reference
+          : idempotencyKey;
+      const providerReference =
+        typeof data.providerReference === 'string' && data.providerReference
+          ? data.providerReference
+          : transferReference;
+      const providerAmountMinorUnits =
+        typeof data.amountMinor === 'bigint'
+          ? data.amountMinor.toString()
+          : typeof data.amountMinor === 'number' &&
+              Number.isSafeInteger(data.amountMinor)
+            ? String(data.amountMinor)
+            : typeof data.amount === 'number' &&
+                Number.isSafeInteger(data.amount)
+              ? String(data.amount)
+              : validatedAmount.amountMinor.toString();
+      const finalTransferValues: FxQuoteTransferValues = {
+        amountMinorUnits: validatedAmount.amountMinor.toString(),
+        providerAmountMinorUnits,
+        currency: payoutCurrency,
+        providerReference,
+        providerTransferId:
+          data.id === undefined || data.id === null ? null : String(data.id),
+        providerTransferCode: data.transfer_code ?? data.transferCode ?? null,
+      };
+
+      if (transferReference) {
+        setTransferStatus({
+          reference: transferReference,
+          status: 'pending',
+          amount: Number(validatedAmount.canonicalDecimal),
+          amountMinor: validatedAmount.amountMinor,
+          currency: payoutCurrency,
+          fxQuote: quote,
+          finalTransferValues,
+          updatedAt: new Date().toISOString(),
+          clientSessionId,
+        });
       }
 
       payoutAuditLedger.recordEvent({
@@ -232,11 +338,11 @@ export async function POST(request: NextRequest) {
         action: 'payout_provider_accepted',
         actor: `provider:${provider.name}`,
         requestCorrelationId: traceContext.traceId,
-        providerReference: transferReference,
+        providerReference,
         metadata: {
-          status: data.status,
-          providerReference: data.providerReference,
-          settlementEstimate: data.settlementEstimate,
+          fxQuote: quote,
+          finalTransferValues,
+          providerStatus: data.status ?? null,
         },
       });
 
@@ -244,23 +350,15 @@ export async function POST(request: NextRequest) {
         result: data,
         payloadHash,
         timestamp: Date.now(),
+        requestFingerprint,
       });
 
-      return NextResponse.json({ success: true, data });
-    } catch (providerError) {
-      if (
-        providerError instanceof ProviderIdempotencyReconciliationRequiredError
-      ) {
-        return NextResponse.json(
-          {
-            success: false,
-            code: 'PROVIDER_RECONCILIATION_REQUIRED',
-            message: providerError.message,
-          },
-          { status: 409 },
-        );
-      }
-
+      return NextResponse.json({
+        success: true,
+        data,
+      });
+    } catch (providerError: unknown) {
+      const now = Date.now();
       const errorMessage =
         providerError instanceof Error
           ? providerError.message
@@ -278,6 +376,8 @@ export async function POST(request: NextRequest) {
           amount: Number(validatedAmount.canonicalDecimal),
           recipient,
           reason,
+          fxQuote: quote,
+          amountMinorUnits: validatedAmount.amountMinor.toString(),
         },
         error: errorMessage,
         correlationId: traceContext.traceId,
@@ -288,8 +388,11 @@ export async function POST(request: NextRequest) {
         status: 'pending',
         amount: Number(validatedAmount.canonicalDecimal),
         amountMinor: validatedAmount.amountMinor,
-        currency,
-        updatedAt: new Date().toISOString(),
+        currency: payoutCurrency,
+        fxQuote: quote,
+        finalTransferValues: initialTransferValues,
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
         clientSessionId,
         failureReason: `Transfer outcome requires reconciliation: ${errorMessage}`,
       });

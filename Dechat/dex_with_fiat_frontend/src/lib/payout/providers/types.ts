@@ -134,6 +134,19 @@ export interface InitiatedTransfer {
   rawResponse?: unknown;
 }
 
+export interface InitiatedTransfer {
+  reference: string;
+  status?: string;
+  id?: string | number;
+  transfer_code?: string;
+  transferCode?: string;
+  providerReference?: string;
+  amount?: number;
+  amountMinor?: number | bigint;
+  currency?: string;
+  rawResponse?: unknown;
+}
+
 // Backward compatibility alias
 export type InitiateTransferResult = InitiatedTransfer;
 
