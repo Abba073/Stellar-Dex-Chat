@@ -42,8 +42,6 @@ import {
   type ResumableTransferState,
 } from '@/lib/transferStatusReconciler';
 import { z } from 'zod';
-import ErrorSummary from '@/components/ErrorSummary';
-import { classifyError, type AccessibleError } from '@/lib/errorMessages';
 import { useRtlDirection } from '@/hooks/useRtlDirection';
 
 /** ISO 13616 MOD-97 check used by the IBAN standard. */
@@ -167,7 +165,6 @@ const stepVariants = {
   },
 };
 
-
 type Step = 1 | 2 | 3 | 4;
 
 export default function BankDetailsModal({
@@ -254,15 +251,12 @@ export default function BankDetailsModal({
   const walletReconnect = walletContext?.reconnect;
 
   // Cross-tab coordination
-  const {
-    activeIntent,
-    isBlockedByAnotherTab,
-    acquireIntent,
-    releaseIntent,
-  } = useCrossTabPayoutCoordination(activeAddress);
+  const { activeIntent, isBlockedByAnotherTab, acquireIntent, releaseIntent } =
+    useCrossTabPayoutCoordination(activeAddress);
 
   // Resumable linked transfer timeline state
-  const [timelineState, setTimelineState] = useState<ResumableTransferState | null>(null);
+  const [timelineState, setTimelineState] =
+    useState<ResumableTransferState | null>(null);
 
   // Step 4 — success & status tracking
   const [transferReference, setTransferReference] = useState('');
@@ -458,7 +452,9 @@ export default function BankDetailsModal({
     const result = bankDetailsSchema
       .pick({ iban: true })
       .safeParse({ iban: value });
-    return result.success ? '' : (result.error.issues[0]?.message ?? 'Invalid IBAN');
+    return result.success
+      ? ''
+      : (result.error.issues[0]?.message ?? 'Invalid IBAN');
   };
 
   const handleIbanChange = (value: string) => {
@@ -671,6 +667,9 @@ export default function BankDetailsModal({
             source: 'balance',
             reason: `XLM to NGN - ${xlmAmount} XLM`,
             amount: ngnValue,
+            currency: lockedQuote.currency,
+            quoteId: lockedQuote.quoteId,
+            quoteToken: lockedQuote.quoteToken,
             recipient: recipientJson.data.recipient_code,
             clientSessionId: getOrCreateClientSessionId(),
           }),
@@ -1154,7 +1153,9 @@ export default function BankDetailsModal({
                 <div className="mb-3">
                   <label className="block text-sm text-gray-400 mb-1">
                     IBAN{' '}
-                    <span className="text-gray-500 text-xs">(optional — for international transfers)</span>
+                    <span className="text-gray-500 text-xs">
+                      (optional — for international transfers)
+                    </span>
                   </label>
                   <input
                     type="text"
@@ -1361,15 +1362,15 @@ export default function BankDetailsModal({
                     )}
                   </div>
 
-                    {lockedQuote?.stale && (
-                      <p
-                        role="status"
-                        className="flex items-center gap-2 text-amber-400 text-xs"
-                      >
-                        <AlertCircle className="w-3 h-3 flex-shrink-0" />
-                        Estimated rate: live market prices are unavailable.
-                      </p>
-                    )}
+                  {lockedQuote?.stale && (
+                    <p
+                      role="status"
+                      className="flex items-center gap-2 text-amber-400 text-xs"
+                    >
+                      <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                      Estimated rate: live market prices are unavailable.
+                    </p>
+                  )}
 
                   {/* Quote lock countdown */}
                   {lockedQuote && (
@@ -1476,7 +1477,9 @@ export default function BankDetailsModal({
                   >
                     <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-400" />
                     <span className="text-amber-200 text-xs">
-                      A payout intent for this account is already active in another browser tab. Please complete or close that tab before initiating a new one.
+                      A payout intent for this account is already active in
+                      another browser tab. Please complete or close that tab
+                      before initiating a new one.
                     </span>
                   </motion.div>
                 )}
@@ -1494,7 +1497,8 @@ export default function BankDetailsModal({
                         Wallet Session Expired
                       </p>
                       <p className="text-[11px] text-amber-200/80">
-                        Your payout details have been preserved. Re-authenticate to proceed.
+                        Your payout details have been preserved. Re-authenticate
+                        to proceed.
                       </p>
                     </div>
                     {walletReconnect && (
@@ -1510,34 +1514,36 @@ export default function BankDetailsModal({
                   </motion.div>
                 )}
 
-                {walletContext && !isWalletConnected && !isWalletSessionExpired && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -10 }}
-                    data-testid="wallet-disconnected-banner"
-                    className="theme-soft-warning mb-4 rounded-xl border border-blue-500/40 px-4 py-3 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <p className="font-semibold text-xs text-blue-300">
-                        Wallet Disconnected
-                      </p>
-                      <p className="text-[11px] text-blue-200/80">
-                        Connect your wallet to confirm this payout.
-                      </p>
-                    </div>
-                    {walletReconnect && (
-                      <button
-                        type="button"
-                        data-testid="connect-wallet-button"
-                        onClick={() => void walletReconnect()}
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
-                      >
-                        Connect
-                      </button>
-                    )}
-                  </motion.div>
-                )}
+                {walletContext &&
+                  !isWalletConnected &&
+                  !isWalletSessionExpired && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -10 }}
+                      data-testid="wallet-disconnected-banner"
+                      className="theme-soft-warning mb-4 rounded-xl border border-blue-500/40 px-4 py-3 flex items-center justify-between gap-3"
+                    >
+                      <div>
+                        <p className="font-semibold text-xs text-blue-300">
+                          Wallet Disconnected
+                        </p>
+                        <p className="text-[11px] text-blue-200/80">
+                          Connect your wallet to confirm this payout.
+                        </p>
+                      </div>
+                      {walletReconnect && (
+                        <button
+                          type="button"
+                          data-testid="connect-wallet-button"
+                          onClick={() => void walletReconnect()}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                        >
+                          Connect
+                        </button>
+                      )}
+                    </motion.div>
+                  )}
 
                 {payoutError && (
                   <ErrorSummary id="bdm-payout-error" error={payoutAccessibleError} onDismiss={() => { setPayoutError(''); setPayoutAccessibleError(null); }} data-testid="payout-error" />
@@ -1734,10 +1740,7 @@ export default function BankDetailsModal({
                                 return next;
                               });
                               if (activeIntent) {
-                                releaseIntent(
-                                  activeIntent.intentKey,
-                                  'failed',
-                                );
+                                releaseIntent(activeIntent.intentKey, 'failed');
                               }
                               addNotification(
                                 'payout_cancelled',

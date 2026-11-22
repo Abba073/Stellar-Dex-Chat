@@ -452,6 +452,7 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- **rtl:** Add right-to-left layout support for wallet and payout flows
 
 ### Fixed
 
@@ -1292,6 +1293,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump the actions group across 1 directory with 6 updates
 - **deps-dev:** Bump @types/node
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 

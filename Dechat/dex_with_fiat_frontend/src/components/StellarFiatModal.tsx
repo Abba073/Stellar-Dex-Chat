@@ -17,8 +17,6 @@ import {
 import EmptyState from '@/components/ui/EmptyState';
 import CopyButton from '@/components/ui/CopyButton';
 import { useRtlDirection } from '@/hooks/useRtlDirection';
-import ErrorSummary from '@/components/ErrorSummary';
-import { classifyError, type AccessibleError } from '@/lib/errorMessages';
 import { useStellarWallet } from '@/contexts/StellarWalletContext';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
 import {
@@ -1389,7 +1387,6 @@ export default function StellarFiatModal({
                 placeholder="0.00"
                 disabled={isTransactionBusy}
                 aria-invalid={isAmountInvalid || isOverLimit ? true : undefined}
-                aria-describedby={isAmountInvalid || isOverLimit ? 'sfm-amount-error' : undefined}
                 className={`w-full bg-gray-800 border rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed input-numeric ${isAmountInvalid || isOverLimit
                   ? 'border-red-500 focus:border-red-400'
                   : 'border-gray-600 focus:border-blue-500'

@@ -2,25 +2,33 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
-import { credentialManager } from '@/lib/payout/credentialManager';
-import {
-  AmbiguousInitiationError,
-  ProviderTimeoutError,
-  sanitizeProviderError,
-} from '@/lib/payout/timeoutBudget';
-import { reconcileAmbiguousInitiation } from '@/lib/payout/reconciliation';
+import { sanitizeProviderError } from '@/lib/payout/timeoutBudget';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
+import { setTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
+import {
+  createPayoutErrorResponse,
+  extractOrGenerateCorrelationId,
+  logStructuredError,
+  validationError,
+} from '@/lib/payout/errors';
+import { validatePayoutAmount } from '@/lib/payout/minorUnits';
+import {
+  verifyFxQuote,
+  type FxQuoteTransferValues,
+} from '@/lib/payout/fxQuoteProvenance';
+import type { InitiatedTransfer } from '@/lib/payout/providers/types';
+import { handlePayoutApiError } from '@/lib/payout/circuitBreaker';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
 const idempotencyCache = new Map<
   string,
-  { result: unknown; timestamp: number }
+  { result: unknown; timestamp: number; requestFingerprint: string }
 >();
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -36,6 +44,15 @@ export async function POST(request: NextRequest) {
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
 
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
+  const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+  if (!headerIdempotencyKey) {
+    return validationError({
+      message: 'X-Idempotency-Key header is required',
+      correlationId,
+    });
+  }
+
   const ip = getClientIp(request);
 
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
@@ -47,6 +64,7 @@ export async function POST(request: NextRequest) {
     traceContext.spanId,
     traceContext.traceId,
   );
+  const idempotencyKey = headerIdempotencyKey;
 
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting transfer initiation', {
@@ -93,56 +111,124 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const { source, reason, amount, recipient } = validationResult.data;
-    const bodyRecord = body as Record<string, unknown>;
+    const {
+      source,
+      reason,
+      amount,
+      recipient,
+      currency,
+      quoteId,
+      quoteToken,
+      clientSessionId: bodyClientSessionId,
+    } = validationResult.data;
     const clientSessionId =
-      request.headers.get('x-client-session-id') ||
-      (typeof bodyRecord.clientSessionId === 'string'
-        ? bodyRecord.clientSessionId
-        : undefined);
+      request.headers.get('x-client-session-id') || bodyClientSessionId;
 
-    const activeCred = credentialManager.getActiveCredential();
-    const credentialVersion = activeCred?.version || 'v1';
+    if (!quoteId || !quoteToken) {
+      return createPayoutErrorResponse({
+        status: 428,
+        code: 'FX_QUOTE_REQUIRED',
+        userMessage: 'A valid FX quote is required to initiate this payout.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
+    }
 
-    // Idempotency key from header, body reference, or generated fallback
-    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
-    const idempotencyKey =
-      headerIdempotencyKey ||
-      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
-        ? bodyRecord.reference
-        : null) ||
-      `idem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-
+    const payoutCurrency = (currency || 'NGN').toUpperCase();
+    const validatedAmount = validatePayoutAmount(amount, payoutCurrency);
+    const requestFingerprint = crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({
+          source,
+          reason: reason ?? null,
+          amountMinorUnits: validatedAmount.amountMinor.toString(),
+          currency: payoutCurrency,
+          recipient,
+          quoteId,
+          quoteToken,
+        }),
+      )
+      .digest('hex');
     const cached = idempotencyCache.get(idempotencyKey);
     if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
+      if (cached.requestFingerprint !== requestFingerprint) {
+        return createPayoutErrorResponse({
+          status: 409,
+          code: 'IDEMPOTENCY_CONFLICT',
+          userMessage:
+            'This idempotency key was already used with different payout details.',
+          category: 'validation',
+          retryable: false,
+          correlationId,
+        });
+      }
       return NextResponse.json({ success: true, data: cached.result });
     }
 
-    // Validate payout amounts using integer minor units (Issue #40)
-    const currency =
-      typeof bodyRecord.currency === 'string' ? bodyRecord.currency : 'NGN';
-    const validatedAmount = validatePayoutAmount(amount, currency);
+    const verifiedQuote = verifyFxQuote(quoteToken);
+    if (!verifiedQuote.valid) {
+      const expired = verifiedQuote.reason === 'expired';
+      return createPayoutErrorResponse({
+        status: expired ? 410 : 409,
+        code: expired ? 'FX_QUOTE_EXPIRED' : 'FX_QUOTE_MISMATCH',
+        userMessage: expired
+          ? 'The FX quote has expired. Request a new quote before continuing.'
+          : 'The FX quote is invalid. Request a new quote before continuing.',
+        category: expired ? 'validation' : 'authorization',
+        retryable: false,
+        correlationId,
+      });
+    }
 
-    // Resolve idempotency key: X-Idempotency-Key header, body reference, or generated
-    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
-    const idempotencyKey =
-      headerIdempotencyKey ||
-      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
-        ? bodyRecord.reference
-        : `idemp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
-
-    const cached = idempotencyCache.get(idempotencyKey);
-    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-      return NextResponse.json({ success: true, data: cached.result });
+    const quote = verifiedQuote.quote;
+    if (
+      quote.quoteId !== quoteId ||
+      quote.currency !== payoutCurrency ||
+      quote.precisionDecimals !== validatedAmount.exponent ||
+      quote.fiatAmountMinorUnits !== validatedAmount.amountMinor.toString()
+    ) {
+      return createPayoutErrorResponse({
+        status: 409,
+        code: 'FX_QUOTE_MISMATCH',
+        userMessage:
+          'The payout amount or currency does not match the FX quote.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
     }
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
       hasAmount: !!amount,
       hasRecipient: !!recipient,
-      amount: amount,
+      currency: payoutCurrency,
+      amountMinorUnits: validatedAmount.amountMinor.toString(),
+      quoteId: quote.quoteId,
       idempotencyKey,
     });
+
+    if (Date.now() >= quote.expiresAt) {
+      return createPayoutErrorResponse({
+        status: 410,
+        code: 'FX_QUOTE_EXPIRED',
+        userMessage: 'The FX quote expired before payout submission.',
+        category: 'validation',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const initialTransferValues: FxQuoteTransferValues = {
+      amountMinorUnits: validatedAmount.amountMinor.toString(),
+      providerAmountMinorUnits: validatedAmount.amountMinor.toString(),
+      currency: payoutCurrency,
+      providerReference: idempotencyKey,
+      providerTransferId: null,
+      providerTransferCode: null,
+    };
 
     // Record immutable audit event for payout initiation (Issue #38)
     payoutAuditLedger.recordEvent({
@@ -154,7 +240,8 @@ export async function POST(request: NextRequest) {
       metadata: {
         source,
         reason,
-        amount: Number(amount),
+        fxQuote: quote,
+        finalTransferValues: initialTransferValues,
         recipient,
       },
     });
@@ -162,10 +249,21 @@ export async function POST(request: NextRequest) {
     const provider = getPayoutProvider();
 
     try {
-      const data = await provider.initiateTransfer({
+      if (Date.now() >= quote.expiresAt) {
+        return createPayoutErrorResponse({
+          status: 410,
+          code: 'FX_QUOTE_EXPIRED',
+          userMessage: 'The FX quote expired before payout submission.',
+          category: 'validation',
+          retryable: false,
+          correlationId,
+        });
+      }
+
+      const data: InitiatedTransfer = await provider.initiateTransfer({
         source,
         reason,
-        amount: Number(amount),
+        amount: validatedAmount.canonicalDecimal,
         recipient,
         reference: idempotencyKey,
       });
@@ -174,12 +272,39 @@ export async function POST(request: NextRequest) {
         typeof data.reference === 'string' && data.reference
           ? data.reference
           : idempotencyKey;
+      const providerReference =
+        typeof data.providerReference === 'string' && data.providerReference
+          ? data.providerReference
+          : transferReference;
+      const providerAmountMinorUnits =
+        typeof data.amountMinor === 'bigint'
+          ? data.amountMinor.toString()
+          : typeof data.amountMinor === 'number' &&
+              Number.isSafeInteger(data.amountMinor)
+            ? String(data.amountMinor)
+            : typeof data.amount === 'number' &&
+                Number.isSafeInteger(data.amount)
+              ? String(data.amount)
+              : validatedAmount.amountMinor.toString();
+      const finalTransferValues: FxQuoteTransferValues = {
+        amountMinorUnits: validatedAmount.amountMinor.toString(),
+        providerAmountMinorUnits,
+        currency: payoutCurrency,
+        providerReference,
+        providerTransferId:
+          data.id === undefined || data.id === null ? null : String(data.id),
+        providerTransferCode: data.transfer_code ?? data.transferCode ?? null,
+      };
 
       if (transferReference) {
         setTransferStatus({
           reference: transferReference,
           status: 'pending',
-          amount: Number(amount),
+          amount: Number(validatedAmount.canonicalDecimal),
+          amountMinor: validatedAmount.amountMinor,
+          currency: payoutCurrency,
+          fxQuote: quote,
+          finalTransferValues,
           updatedAt: new Date().toISOString(),
           clientSessionId,
         });
@@ -191,13 +316,18 @@ export async function POST(request: NextRequest) {
         action: 'payout_provider_accepted',
         actor: 'provider:paystack',
         requestCorrelationId: traceContext.traceId,
-        providerReference: transferReference,
-        metadata: { data: data as Record<string, unknown> },
+        providerReference,
+        metadata: {
+          fxQuote: quote,
+          finalTransferValues,
+          providerStatus: data.status ?? null,
+        },
       });
 
       idempotencyCache.set(idempotencyKey, {
         result: data,
         timestamp: Date.now(),
+        requestFingerprint,
       });
 
       return NextResponse.json({
@@ -205,6 +335,7 @@ export async function POST(request: NextRequest) {
         data,
       });
     } catch (providerError: unknown) {
+      const now = Date.now();
       const errorMessage =
         providerError instanceof Error
           ? providerError.message
@@ -216,9 +347,11 @@ export async function POST(request: NextRequest) {
         idempotencyKey,
         payload: {
           source,
-          amount: Number(amount),
+          amount: Number(validatedAmount.canonicalDecimal),
           recipient,
           reason,
+          fxQuote: quote,
+          amountMinorUnits: validatedAmount.amountMinor.toString(),
         },
         error: errorMessage,
         correlationId: traceContext.traceId,
@@ -227,7 +360,11 @@ export async function POST(request: NextRequest) {
       setTransferStatus({
         reference: idempotencyKey,
         status: 'pending',
-        amount: Number(amount),
+        amount: Number(validatedAmount.canonicalDecimal),
+        amountMinor: validatedAmount.amountMinor,
+        currency: payoutCurrency,
+        fxQuote: quote,
+        finalTransferValues: initialTransferValues,
         updatedAt: new Date(now).toISOString(),
         updatedAtMs: now,
         clientSessionId,
