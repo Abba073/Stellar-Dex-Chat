@@ -4,6 +4,11 @@
  * Decouples provider-specific transport, headers, secrets, and response shapes from domain logic.
  */
 
+import type {
+  ProviderSettlementCalendar,
+  SettlementEstimate,
+} from '../settlementCalendar';
+
 export type PayoutProviderName = 'paystack' | 'fake';
 
 /**
@@ -111,7 +116,22 @@ export interface InitiateTransferInput {
   amount: number | string;
   recipient: string;
   reference?: string;
+  idempotencyKey?: string;
+  currency?: string;
   credentialVersion?: string;
+}
+
+export interface InitiatedTransfer {
+  reference: string;
+  status: NormalizedPayoutStatus;
+  providerReference?: string;
+  transferCode?: string;
+  amountMinor?: bigint;
+  currency?: string;
+  recipientCode?: string;
+  credentialVersion?: string;
+  settlementEstimate?: SettlementEstimate;
+  rawResponse?: unknown;
 }
 
 export interface InitiatedTransfer {
@@ -172,6 +192,7 @@ export interface CancelTransferResult {
 
 export interface PayoutProvider {
   name: PayoutProviderName;
+  settlementCalendars?: readonly ProviderSettlementCalendar[];
 
   verifyAccount(input: VerifyAccountInput): Promise<VerifyAccountResult>;
   createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult>;

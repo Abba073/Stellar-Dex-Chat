@@ -24,6 +24,9 @@ vi.mock('@sentry/nextjs', () => ({
 vi.mock('@/lib/rateLimit', () => ({
   applyRateLimit: vi.fn(() => null),
   getClientIp: vi.fn(() => '127.0.0.1'),
+  ROUTE_COST_BUCKETS: {
+    '/api/initiate-transfer': { maxRequests: 10, windowMs: 60_000 },
+  },
 }));
 
 vi.mock('@/lib/transferStore', () => ({
@@ -268,6 +271,32 @@ describe('POST /api/initiate-transfer (Issue #32)', () => {
     );
     expect(conflict.status).toBe(409);
     expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
+  });
+
+  it('links the reserved contract receipt to the accepted provider transfer', async () => {
+    const payoutId = `payout-${Date.now()}`;
+    const receiptId = `receipt-${Date.now()}`;
+    const req = makeRequest(
+      {
+        source: 'wallet',
+        reason: 'payment',
+        amount: '100',
+        recipient: 'GABC123',
+        contractReceiptId: receiptId,
+      },
+      { 'X-Idempotency-Key': payoutId },
+    );
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    expect(payoutReservationLedger.getReservation(payoutId)).toMatchObject({
+      contractReceiptId: receiptId,
+      amountMinor: '10000',
+      currency: 'NGN',
+      providerTransferReference: 'ref-123',
+      status: 'reserved',
+    });
   });
 
   it('enqueues failed provider calls into durable retry queue without losing intent', async () => {

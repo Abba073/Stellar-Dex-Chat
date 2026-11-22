@@ -8,6 +8,11 @@ import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { setTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+import {
+  payoutReservationLedger,
+  PayoutReservationConflictError,
+} from '@/lib/payout/reservationLedger';
+import { ProviderIdempotencyReconciliationRequiredError } from '@/lib/payout/providerIdempotency';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
@@ -24,13 +29,31 @@ import {
 import type { InitiatedTransfer } from '@/lib/payout/providers/types';
 import { handlePayoutApiError } from '@/lib/payout/circuitBreaker';
 
-const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
-
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const RATE_LIMIT = ROUTE_COST_BUCKETS['/api/initiate-transfer'];
 const idempotencyCache = new Map<
   string,
   { result: unknown; timestamp: number; requestFingerprint: string }
 >();
-const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+function hashPayoutRequest(payload: {
+  source: string;
+  reason?: string;
+  amountMinor: bigint;
+  currency: string;
+  recipient: string;
+  contractReceiptId?: string;
+}): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        ...payload,
+        amountMinor: payload.amountMinor.toString(),
+      }),
+    )
+    .digest('hex');
+}
 
 export async function OPTIONS(request: NextRequest) {
   return (
@@ -40,7 +63,6 @@ export async function OPTIONS(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
 
@@ -54,8 +76,9 @@ export async function POST(request: NextRequest) {
   }
 
   const ip = getClientIp(request);
-
-  const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
+  const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT, {
+    correlationId,
+  });
   if (limited) return limited;
 
   const traceContext = telemetry.extractTraceFromHeaders(request.headers);
@@ -67,23 +90,10 @@ export async function POST(request: NextRequest) {
   const idempotencyKey = headerIdempotencyKey;
 
   try {
-    telemetry.addLog(span.spanId, 'info', 'Starting transfer initiation', {
-      endpoint: '/api/initiate-transfer',
-      correlationId,
-    });
-
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body', {
-        correlationId,
-      });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Invalid JSON body',
-      });
-
       return validationError({
         message: 'Invalid JSON in request body.',
         correlationId,
@@ -91,23 +101,33 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Validate with strict Zod schema
-    const validationResult = initiateTransferSchema.safeParse(body);
-
-    if (!validationResult.success) {
-      telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
-        errors: validationResult.error.issues,
+    const bodyRecord =
+      body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+    idempotencyKey =
+      headerIdempotencyKey ||
+      (typeof bodyRecord.reference === 'string' ? bodyRecord.reference : '');
+    if (!idempotencyKey) {
+      return validationError({
+        message: 'X-Idempotency-Key header is required.',
         correlationId,
+        code: 'INVALID_INPUT',
       });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Validation failed',
-      });
+    }
 
+    const validationResult = initiateTransferSchema.safeParse(body);
+    if (!validationResult.success) {
       return validationError({
         message: 'Validation failed',
         correlationId,
-        issues: validationResult.error.issues,
+        issues: validationResult.error.issues.map((issue) => ({
+          path: issue.path.filter(
+            (segment): segment is string | number =>
+              typeof segment !== 'symbol',
+          ),
+          message: issue.message,
+          code: issue.code,
+        })),
       });
     }
 
@@ -199,6 +219,7 @@ export async function POST(request: NextRequest) {
         correlationId,
       });
     }
+    if (cached) idempotencyCache.delete(idempotencyKey);
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
@@ -247,7 +268,6 @@ export async function POST(request: NextRequest) {
     });
 
     const provider = getPayoutProvider();
-
     try {
       if (Date.now() >= quote.expiresAt) {
         return createPayoutErrorResponse({
@@ -266,6 +286,9 @@ export async function POST(request: NextRequest) {
         amount: validatedAmount.canonicalDecimal,
         recipient,
         reference: idempotencyKey,
+        idempotencyKey,
+        currency,
+        credentialVersion,
       });
 
       const transferReference =
@@ -310,11 +333,10 @@ export async function POST(request: NextRequest) {
         });
       }
 
-      // Record successful provider acceptance in audit ledger
       payoutAuditLedger.recordEvent({
-        payoutId: transferReference,
+        payoutId: idempotencyKey,
         action: 'payout_provider_accepted',
-        actor: 'provider:paystack',
+        actor: `provider:${provider.name}`,
         requestCorrelationId: traceContext.traceId,
         providerReference,
         metadata: {
@@ -326,6 +348,7 @@ export async function POST(request: NextRequest) {
 
       idempotencyCache.set(idempotencyKey, {
         result: data,
+        payloadHash,
         timestamp: Date.now(),
         requestFingerprint,
       });
@@ -341,7 +364,10 @@ export async function POST(request: NextRequest) {
           ? providerError.message
           : 'Unknown provider error';
 
-      // Enqueue into durable retry queue instead of losing payout intent (Issue #37)
+      if (contractReceiptId) {
+        payoutReservationLedger.markUnderReview(idempotencyKey);
+      }
+
       const retryJob = payoutRetryQueue.enqueueJob({
         payoutId: idempotencyKey,
         idempotencyKey,
@@ -368,19 +394,8 @@ export async function POST(request: NextRequest) {
         updatedAt: new Date(now).toISOString(),
         updatedAtMs: now,
         clientSessionId,
-        failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
+        failureReason: `Transfer outcome requires reconciliation: ${errorMessage}`,
       });
-
-      telemetry.addLog(
-        span.spanId,
-        'warn',
-        'Provider call failed; enqueued into retry queue',
-        {
-          jobId: retryJob.id,
-          idempotencyKey,
-          error: errorMessage,
-        },
-      );
 
       return NextResponse.json(
         {
@@ -388,7 +403,7 @@ export async function POST(request: NextRequest) {
           status: 'queued_for_retry',
           reference: idempotencyKey,
           jobId: retryJob.id,
-          message: 'Transfer queued for retry due to provider failure',
+          message: 'Transfer queued for retry due to provider uncertainty',
         },
         { status: 202 },
       );
@@ -397,43 +412,27 @@ export async function POST(request: NextRequest) {
     logStructuredError('initiate-transfer', error, {
       endpoint: '/api/initiate-transfer',
       correlationId,
-      ip: getClientIp(request),
+      ip,
     });
-
     Sentry.captureException(error, {
       tags: {
         endpoint: '/api/initiate-transfer',
         operation: 'transfer_initiation',
       },
-      extra: {
-        ip: getClientIp(request),
-        correlationId,
-        traceId: traceContext.traceId,
-        spanId: span.spanId,
-      },
+      extra: { ip, correlationId, traceId: traceContext.traceId },
     });
-
-    const sanitized = sanitizeProviderError(error, 'initiate', idempotencyKey);
-
-    telemetry.addLog(
-      span.spanId,
-      'error',
-      'Unhandled error in transfer initiation',
-      { error: sanitized.message, code: sanitized.code },
-    );
-
-    console.error('Initiate transfer error:', error);
-
+    telemetry.addLog(span.spanId, 'error', 'Transfer initiation failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      idempotencyKey,
+    });
     const errorDetails = handlePayoutApiError(
       error,
       'Failed to initiate transfer. Please try again.',
     );
-
     telemetry.finishSpan(span.spanId, {
       success: false,
       error: errorDetails.body.message,
     });
-
     return NextResponse.json(errorDetails.body, {
       status: errorDetails.status,
       headers: errorDetails.headers,
