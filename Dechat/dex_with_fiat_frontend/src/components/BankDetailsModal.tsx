@@ -34,6 +34,7 @@ import { getOrCreateClientSessionId } from '@/lib/clientSession';
 import { chatTelemetry } from '@/lib/chatTelemetry';
 import { StellarWalletContext } from '@/contexts/StellarWalletContext';
 import { useCrossTabPayoutCoordination } from '@/hooks/useCrossTabPayoutCoordination';
+import { signMessage } from '@stellar/freighter-api';
 import {
   createInitialTransferState,
   reconcileTransferStatus,
@@ -99,6 +100,9 @@ interface Bank {
 
 interface VerifyAccountData {
   account_name: string;
+  accountNumberMasked: string;
+  verificationToken: string;
+  verificationExpiresAt: string;
 }
 
 interface CreateRecipientData {
@@ -111,6 +115,13 @@ interface InitiateTransferData {
   transfer_code: string;
   status: string;
   [key: string]: unknown;
+}
+
+interface WalletApiSession {
+  address: string;
+  sessionToken: string;
+  csrfToken: string;
+  expiresAt: number;
 }
 
 export interface BankDetailsModalProps {
@@ -249,6 +260,88 @@ export default function BankDetailsModal({
   const isWalletConnected = walletContext?.connection?.isConnected ?? true;
   const isWalletSessionExpired = walletContext?.sessionExpired ?? false;
   const walletReconnect = walletContext?.reconnect;
+  const walletApiSessionRef = useRef<WalletApiSession | null>(null);
+
+  const getWalletApiAuthHeaders = useCallback(async (): Promise<
+    Record<string, string>
+  > => {
+    if (
+      process.env.NODE_ENV === 'test' ||
+      process.env.NEXT_PUBLIC_E2E === 'true'
+    ) {
+      return {};
+    }
+
+    if (!activeAddress) {
+      throw new Error('Connect a wallet to authorize beneficiary verification.');
+    }
+
+    const cachedSession = walletApiSessionRef.current;
+    if (
+      cachedSession?.address === activeAddress &&
+      cachedSession.expiresAt > Date.now() + 60_000
+    ) {
+      return {
+        Authorization: `Bearer ${cachedSession.sessionToken}`,
+        'X-CSRF-Token': cachedSession.csrfToken,
+      };
+    }
+
+    const timestamp = Date.now();
+    const message = `authenticate:${activeAddress}:${timestamp}`;
+    const signed = await signMessage(message, {
+      address: activeAddress,
+      networkPassphrase: walletContext?.connection?.networkPassphrase,
+    });
+    const signature =
+      typeof signed.signedMessage === 'string'
+        ? signed.signedMessage
+        : signed.signedMessage?.toString('base64');
+
+    if (
+      signed.error ||
+      !signature ||
+      signed.signerAddress.toLowerCase() !== activeAddress.toLowerCase()
+    ) {
+      throw new Error('Wallet authorization was cancelled or failed.');
+    }
+
+    const response = await fetch('/api/auth/wallet-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        address: activeAddress,
+        signature,
+        timestamp,
+      }),
+    });
+    const result: {
+      success: boolean;
+      data?: WalletApiSession;
+      message?: string;
+    } = await response.json();
+
+    if (
+      !response.ok ||
+      !result.success ||
+      !result.data?.sessionToken ||
+      !result.data.csrfToken ||
+      !Number.isFinite(result.data.expiresAt) ||
+      typeof result.data.address !== 'string' ||
+      result.data.address.toLowerCase() !== activeAddress.toLowerCase()
+    ) {
+      throw new Error(result.message ?? 'Wallet authorization failed.');
+    }
+
+    walletApiSessionRef.current = result.data;
+    return {
+      Authorization: `Bearer ${result.data.sessionToken}`,
+      'X-CSRF-Token': result.data.csrfToken,
+    };
+  }, [
+    activeAddress,
+    walletContext?.connection?.networkPassphrase,
+  ]);
 
   // Cross-tab coordination
   const { activeIntent, isBlockedByAnotherTab, acquireIntent, releaseIntent } =
@@ -496,9 +589,13 @@ export default function BankDetailsModal({
     setVerifyError('');
     setVerifiedAccount(null);
     try {
+      const authHeaders = await getWalletApiAuthHeaders();
       const res = await fetch('/api/verify-account', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
         body: JSON.stringify({
           accountNumber,
           bankCode: selectedBank.code,
@@ -535,12 +632,12 @@ export default function BankDetailsModal({
         action: 'account_verify_fail',
         step: 2,
         xlmAmount,
-        errorMessage: 'network_error',
+        errorMessage: message,
       });
     } finally {
       setVerifying(false);
     }
-  }, [accountNumber, iban, selectedBank, xlmAmount]);
+  }, [accountNumber, getWalletApiAuthHeaders, iban, selectedBank, xlmAmount]);
 
   const handleConfirmPayout = async () => {
     if (
@@ -607,12 +704,14 @@ export default function BankDetailsModal({
       pushStatusEvent('initiated', 'Transfer initiated');
       addNotification('payout_pending', 'Fiat payout request is pending...');
       try {
+        const authHeaders = await getWalletApiAuthHeaders();
         // 1. Create Paystack transfer recipient
         const recipientRes = await fetch('/api/create-recipient', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-Idempotency-Key': idempotencyKey,
+            ...authHeaders,
           },
           body: JSON.stringify({
             type: 'nuban',
@@ -620,14 +719,30 @@ export default function BankDetailsModal({
             account_number: accountNumber,
             bank_code: selectedBank.code,
             currency: 'NGN',
+            verificationToken: verifiedAccount.verificationToken,
           }),
         });
         const recipientJson: {
           success: boolean;
           data: CreateRecipientData;
           message?: string;
+          error?: { code?: string };
         } = await recipientRes.json();
         if (!recipientJson.success) {
+          if (
+            recipientJson.error?.code ===
+              'BENEFICIARY_VERIFICATION_REQUIRED' ||
+            recipientJson.error?.code ===
+              'BENEFICIARY_VERIFICATION_EXPIRED' ||
+            recipientJson.error?.code === 'BENEFICIARY_DETAILS_CHANGED'
+          ) {
+            setVerifiedAccount(null);
+            setVerifyError(
+              recipientJson.message ??
+                'Verify the beneficiary details again to continue.',
+            );
+            setStep(2);
+          }
           throw new Error(
             recipientJson.message ?? 'Failed to create transfer recipient',
           );
@@ -662,6 +777,7 @@ export default function BankDetailsModal({
           headers: {
             'Content-Type': 'application/json',
             'X-Idempotency-Key': idempotencyKey,
+            ...authHeaders,
           },
           body: JSON.stringify({
             source: 'balance',
@@ -789,14 +905,15 @@ export default function BankDetailsModal({
       setSelectedBank(bank);
     }
     setAccountNumber(beneficiary.accountNumber);
-    setVerifiedAccount({ account_name: beneficiary.accountName });
+    setVerifiedAccount(null);
+    setVerifyError('');
     setShowSavedBeneficiaries(false);
     chatTelemetry.fiatPayoutStep({
       action: 'beneficiary_selected',
       step: 1,
       xlmAmount,
     });
-    setStep(3);
+    setStep(2);
   };
 
   const handleStartRename = (beneficiary: Beneficiary) => {
@@ -1073,11 +1190,12 @@ export default function BankDetailsModal({
                             type="button"
                             onClick={() => {
                               setSelectedBank(bank);
+                              setVerifiedAccount(null);
+                              setVerifyError('');
                               chatTelemetry.fiatPayoutStep({
                                 action: 'bank_selected',
                                 step: 1,
                                 xlmAmount,
-                                bankCode: bank.code,
                               });
                             }}
                             className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${

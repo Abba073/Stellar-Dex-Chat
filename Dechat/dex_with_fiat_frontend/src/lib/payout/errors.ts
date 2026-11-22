@@ -239,7 +239,12 @@ export function validationError(options: {
     retryable: false,
     correlationId: options.correlationId,
     details,
-    rawErrors: options.issues,
+    rawErrors: options.issues?.map((issue) => ({
+      path: issue.path
+        ?.filter((part): part is string | number => typeof part !== 'symbol'),
+      message: issue.message,
+      code: issue.code,
+    })),
   });
 }
 
