@@ -4,20 +4,18 @@ import { randomUUID } from 'crypto';
 export const API_VERSION = 'v1' as const;
 
 export type PayoutErrorCategory =
-  | 'validation'
-  | 'authorization'
-  | 'provider'
-  | 'rate_limit'
-  | 'internal';
+  'validation' | 'authorization' | 'provider' | 'rate_limit' | 'internal';
 
 export type PayoutErrorCode =
   // Validation errors (400)
   | 'VALIDATION_ERROR'
   | 'MALFORMED_REQUEST'
   | 'INVALID_INPUT'
-  | 'BENEFICIARY_VERIFICATION_REQUIRED'
-  | 'BENEFICIARY_VERIFICATION_EXPIRED'
-  | 'BENEFICIARY_DETAILS_CHANGED'
+  | 'FX_QUOTE_REQUIRED'
+  | 'FX_QUOTE_EXPIRED'
+  | 'FX_QUOTE_MISMATCH'
+  | 'FX_QUOTE_UNAVAILABLE'
+  | 'IDEMPOTENCY_CONFLICT'
   // Authorization errors (401, 403)
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
@@ -143,7 +141,10 @@ export function logStructuredError(
   error: unknown,
   metadata?: Record<string, unknown>,
 ): void {
-  const sanitizedMeta = redactSecrets(metadata || {}) as Record<string, unknown>;
+  const sanitizedMeta = redactSecrets(metadata || {}) as Record<
+    string,
+    unknown
+  >;
   const errMessage = error instanceof Error ? error.message : String(error);
   const errStack = error instanceof Error ? error.stack : undefined;
 
@@ -217,7 +218,11 @@ export function createPayoutErrorResponse(options: {
 export function validationError(options: {
   message?: string;
   correlationId?: string;
-  issues?: Array<{ path?: (string | number)[]; message: string; code?: string }>;
+  issues?: Array<{
+    path?: (string | number)[];
+    message: string;
+    code?: string;
+  }>;
   code?: PayoutErrorCode;
 }): NextResponse {
   const details: PayoutErrorDetail[] = (options.issues || []).map((issue) => ({
@@ -315,7 +320,8 @@ export function providerError(options: {
   let code: PayoutErrorCode = 'PROVIDER_ERROR';
   let retryable = true;
   let userMessage =
-    options.safeMessage || 'Payment provider encountered an error. Please try again.';
+    options.safeMessage ||
+    'Payment provider encountered an error. Please try again.';
 
   if (providerStatus === 422) {
     status = 400;
@@ -331,7 +337,8 @@ export function providerError(options: {
     status = 503;
     code = 'PROVIDER_UNAVAILABLE';
     retryable = true;
-    userMessage = 'Payment provider is currently unavailable. Please try again later.';
+    userMessage =
+      'Payment provider is currently unavailable. Please try again later.';
   }
 
   return createPayoutErrorResponse({
