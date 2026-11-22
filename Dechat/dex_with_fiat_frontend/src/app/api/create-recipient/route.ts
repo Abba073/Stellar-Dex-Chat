@@ -12,12 +12,13 @@ import { getOrCreateBeneficiary } from '@/lib/payout/beneficiaryStore';
 import {
   extractOrGenerateCorrelationId,
   validationError,
-  logStructuredError,
+  createPayoutErrorResponse,
 } from '@/lib/payout/errors';
+import { resolveCallerIdentity } from '@/lib/payout/auth';
 import {
-  enforcePayoutApiVersion,
-  payoutSuccessResponse,
-} from '@/lib/payout/schemaEvolution';
+  getWalletIdentityScope,
+  validateBeneficiaryVerification,
+} from '@/lib/payout/beneficiaryVerification';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
 
@@ -78,7 +79,10 @@ export async function POST(request: NextRequest) {
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
-        errors: validationResult.error.issues,
+        errors: validationResult.error.issues.map(({ path, code }) => ({
+          path,
+          code,
+        })),
         correlationId,
       });
       telemetry.finishSpan(span.spanId, {
@@ -93,8 +97,56 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const { type, name, account_number, bank_code, currency, description } =
-      validationResult.data;
+    const {
+      type,
+      name,
+      account_number,
+      bank_code,
+      currency,
+      verificationToken,
+    } = validationResult.data;
+
+    const identity = await resolveCallerIdentity(request);
+    const userScope = getWalletIdentityScope(identity);
+    if (!userScope) {
+      return createPayoutErrorResponse({
+        status: 401,
+        code: 'UNAUTHORIZED',
+        userMessage:
+          'A verified wallet session is required to create a recipient',
+        category: 'authorization',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const verification = validateBeneficiaryVerification(verificationToken, {
+      accountNumber: account_number,
+      bankCode: bank_code,
+      currency,
+      identityScope: userScope,
+      accountName: name,
+    });
+    if (!verification.valid) {
+      const expired = verification.reason === 'expired';
+      const changed = verification.reason === 'details_changed';
+      return createPayoutErrorResponse({
+        status: changed ? 409 : 403,
+        code: changed
+          ? 'BENEFICIARY_DETAILS_CHANGED'
+          : expired
+            ? 'BENEFICIARY_VERIFICATION_EXPIRED'
+            : 'BENEFICIARY_VERIFICATION_REQUIRED',
+        userMessage: changed
+          ? 'Beneficiary details changed. Verify the account again before creating a recipient.'
+          : expired
+            ? 'Beneficiary verification expired. Verify the account again.'
+            : 'Verify the beneficiary details before creating a recipient.',
+        category: changed ? 'validation' : 'authorization',
+        retryable: false,
+        correlationId,
+      });
+    }
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasType: !!type,
@@ -102,11 +154,6 @@ export async function POST(request: NextRequest) {
       currency,
       correlationId,
     });
-
-    const userScope =
-      request.headers.get('x-user-scope') ||
-      request.headers.get('x-user-id') ||
-      ip;
 
     const provider = getPayoutProvider();
     const breaker = getProviderCircuitBreaker(provider.name);
@@ -153,7 +200,7 @@ export async function POST(request: NextRequest) {
       'error',
       'Unhandled error in recipient creation',
       {
-        error: error instanceof Error ? error.message : 'Unknown error',
+        errorType: error instanceof Error ? error.name : 'UnknownError',
         correlationId,
       },
     );
@@ -162,15 +209,25 @@ export async function POST(request: NextRequest) {
       error,
       'Failed to create recipient. Please try again.',
     );
+    const safeMessage =
+      errorDetails.status >= 500
+        ? 'Recipient creation is temporarily unavailable. Please try again.'
+        : 'Failed to create recipient. Check the beneficiary details and try again.';
 
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: errorDetails.body.message,
+      error: safeMessage,
     });
 
-    return NextResponse.json(errorDetails.body, {
-      status: errorDetails.status,
-      headers: errorDetails.headers,
-    });
+    return NextResponse.json(
+      {
+        ...errorDetails.body,
+        message: safeMessage,
+      },
+      {
+        status: errorDetails.status,
+        headers: errorDetails.headers,
+      },
+    );
   }
 }
